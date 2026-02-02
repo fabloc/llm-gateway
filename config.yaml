@@ -1,0 +1,13 @@
+max_total_attempts: 3
+
+# Strategy for each attempt index (0 = initial, 1 = first retry, etc.)
+retry_strategies:
+  - attempt_index: 0
+    target_hostname: "https://primary-api.upstream.com"
+    timeout_seconds: 30.0
+
+  - attempt_index: 3
+    target_hostname: "https://secondary-api.upstream.com"
+    extra_headers:
+      X-Vertex-AI-LLM-Shared-Request: "priority"
+    timeout_seconds: 30.0
