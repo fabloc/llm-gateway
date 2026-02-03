@@ -26,13 +26,13 @@ class ProxyConfig(BaseModel):
     max_total_attempts: int
     retry_strategies: List[RetryStrategy]
 
-    def get_strategy(self, attempt: int) -> Optional[RetryStrategy]:
+    def get_strategy(self, attempt: int, prev_retry_strategy: RetryStrategy = None) -> Optional[RetryStrategy]:
         """Finds the configuration specific to the current attempt index."""
         for strategy in self.retry_strategies:
             if strategy.attempt_index == attempt:
                 return strategy
         # Fallback: if config is missing for this specific attempt, use the last defined one
-        return self.retry_strategies[-1] if self.retry_strategies else None
+        return prev_retry_strategy if self.retry_strategies else None
 
 # --- Global State ---
 # In a real app, this might be injected via dependency injection
@@ -68,7 +68,8 @@ app = FastAPI(lifespan=lifespan)
 # --- Utility Logic ---
 
 def transform_outbound_request(
-    original_request: Request, 
+    original_request: Request,
+    path: str,
     strategy: RetryStrategy, 
     body_content: bytes
 ) -> dict:
@@ -78,7 +79,7 @@ def transform_outbound_request(
     """
     # 1. Construct new URL
     # We strip the hostname from original and append path to the target hostname
-    url = f"{strategy.target_hostname}{original_request.url.path}"
+    url = f"{strategy.target_hostname}/{path}"
     if original_request.url.query:
         url += f"?{original_request.url.query}"
 
@@ -113,6 +114,7 @@ async def proxy_handler(request: Request, path: str):
     body = await request.body()
     
     current_attempt = 0
+    strategy = None
     last_response: Optional[httpx.Response] = None
     last_exception: Optional[Exception] = None
 
@@ -120,14 +122,17 @@ async def proxy_handler(request: Request, path: str):
     while current_attempt < app_config.max_total_attempts:
         
         # a. Look up transformation logic
-        strategy = app_config.get_strategy(current_attempt)
+        new_strategy = app_config.get_strategy(current_attempt, strategy)
         
-        if not strategy:
+        if not new_strategy and not strategy:
             logger.error(f"No strategy found for attempt {current_attempt}. Aborting.")
             break
+        
+        if new_strategy:
+            strategy = new_strategy
 
         # b. Transform Request
-        req_params = transform_outbound_request(request, strategy, body)
+        req_params = transform_outbound_request(request, path, strategy, body)
         
         logger.info(
             f"Attempt {current_attempt + 1}/{app_config.max_total_attempts}: "
@@ -139,9 +144,9 @@ async def proxy_handler(request: Request, path: str):
             response = await http_client.request(**req_params)
             
             # d. Success Condition (Business Logic)
-            # We assume 5xx errors trigger a retry, but 2xx/3xx/4xx are valid responses.
+            # We assume 429 and 5xx errors trigger a retry, but 2xx/3xx and other 4xx are valid responses.
             # You can adjust this logic (e.g., retry on 429 Too Many Requests).
-            if response.status_code < 500:
+            if response.status_code < 500 and response.status_code != 429:
                 logger.info(f"Success: Received {response.status_code}")
                 
                 # Stream response back to client (performance best practice)
@@ -152,7 +157,7 @@ async def proxy_handler(request: Request, path: str):
                     # Filter hop-by-hop headers if necessary
                 )
             
-            # If 5xx, we store it and loop again
+            # If 429 and 5xx, we store it and loop again
             logger.warning(f"Upstream returned {response.status_code}. Retrying...")
             last_response = response
 
@@ -167,20 +172,11 @@ async def proxy_handler(request: Request, path: str):
     # If we are here, we exhausted retries. Return the last error state.
     logger.error("Max retries exhausted.")
 
-    if last_response:
-        return Response(
-            content=last_response.content,
-            status_code=last_response.status_code,
-            media_type=last_response.headers.get("content-type")
-        )
-    
-    if last_exception:
-        # If we never got a response (network down), return 502 Bad Gateway
-        return Response(
-            content=f"Upstream unreachable: {str(last_exception)}",
-            status_code=status.HTTP_502_BAD_GATEWAY
-        )
+    # If the last response from downstream was a 5xx, propagate that status.
+    if last_response and 500 <= last_response.status_code < 600:
+        return Response(status_code=last_response.status_code)
 
-    return Response(content="Configuration Error", status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    # For all other exhausted retry scenarios, return 429.
+    return Response(status_code=status.HTTP_429_TOO_MANY_REQUESTS)
 
 # To run: uvicorn main:app --reload
