@@ -1,5 +1,6 @@
 import logging
 import yaml
+import re
 from typing import List, Dict, Optional, Any
 from contextlib import asynccontextmanager
 
@@ -13,6 +14,39 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("ProxyServer")
+
+class ModelInfos:
+    project: str
+    location: str
+    provider: str
+    id: str
+    # Define the pattern with named capture groups (?P<name>...)
+    # This pattern looks for the literal keys and captures the values following them
+    pattern = (
+        r"^v[a-z0-9]+"  
+        r"/projects/(?P<project>[^/]+)"
+        r"/locations/(?P<location>[^/]+)"
+        r"/publishers/(?P<provider>[^/]+)"
+        r"/models/(?P<id>[^/:]+)"
+    )
+    
+    def __init__(self, path: str):
+
+        match = re.search(self.pattern, path)
+
+        if match:
+            # Extracting variables
+            data = match.groupdict()
+            project = data['project']
+            location = data['location']
+            provider = data['provider']
+            model_id = data['id']
+            
+            print(f"Success! Project: {project}, Location: {location}, Provider: {provider}, ID: {model_id}")
+        else:
+            # Special processing for non-conforming paths
+            print("Path does not conform to the expected structure. Initiating fallback logic...")
+            # handle_custom_logic(url_path)
 
 # --- Configuration Models (Pydantic) ---
 
@@ -109,6 +143,9 @@ async def proxy_handler(request: Request, path: str):
     """
     Main entry point. Handles the retry loop logic.
     """
+
+    model_infos = ModelInfos(path)
+
     # 1. Read body once (cannot stream request body easily in a retry loop 
     # as we need to replay it)
     body = await request.body()
